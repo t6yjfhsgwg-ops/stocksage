@@ -39,7 +39,7 @@ Deploy the `dist/` folder to Vercel (Framework: Vite).
 
 ## Help tour & video script
 
-- In the app: click **❓ Help** (auto-plays on first visit like a video tour)
+- In the app: click **❓ Help** for an interactive spotlight tour (try each feature to advance)
 - To record a real video: see [HELP-VIDEO-SCRIPT.md](HELP-VIDEO-SCRIPT.md)
 
 _Not financial advice._

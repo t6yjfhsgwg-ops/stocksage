@@ -388,7 +388,6 @@ export default function StockSage() {
   const [toast, setToast] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [helpAutoPlay, setHelpAutoPlay] = useState(false);
   const [theme, setTheme] = useState("dark");
   const [refreshMin, setRefreshMin] = useState(5);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("stocksage_api_key") || "");
@@ -457,18 +456,18 @@ export default function StockSage() {
       setLoading(false);
       setToast("Market data loaded — " + watchlist.length + " stocks analyzed");
       setTimeout(() => setToast(null), 4000);
-      if (shouldShowHelpOnFirstVisit()) {
-        setHelpAutoPlay(true);
-        setHelpOpen(true);
-      }
+      if (shouldShowHelpOnFirstVisit()) setHelpOpen(true);
     })();
   }, []);
 
   const closeHelp = () => {
     setHelpOpen(false);
-    setHelpAutoPlay(false);
     markHelpSeen();
   };
+
+  const onHelpStep = useCallback((stepId) => {
+    if (stepId === "chat") setChatOpen(true);
+  }, []);
 
   useEffect(() => {
     if (!active) return;
@@ -549,7 +548,7 @@ export default function StockSage() {
         StockSage is for informational purposes only. Not financial advice. Always do your own research.
       </div>
 
-      <div className="market-strip">
+      <div className="market-strip" data-tour="market-strip">
         {INDICES.map((ind) => {
           const d = indices[ind.symbol];
           const chg = d?.change;
@@ -572,7 +571,7 @@ export default function StockSage() {
       )}
 
       <div className="layout">
-        <aside className="sidebar">
+        <aside className="sidebar" data-tour="watchlist">
           <div className="sidebar-h">
             <h2>Watchlist</h2>
             <span className="live-dot" title="Live" />
@@ -613,7 +612,7 @@ export default function StockSage() {
 
         <main className="main">
           {dailyPick && (
-            <div className="daily-pick">
+            <div className="daily-pick" data-tour="daily-pick">
               <h3>⭐ Daily Pick · {dailyPick.ts}</h3>
               <div className="big">{dailyPick.symbol} — {dailyPick.name}</div>
               <p style={{ marginTop: 8, fontFamily: "var(--mono)" }}>
@@ -626,10 +625,10 @@ export default function StockSage() {
             </div>
           )}
 
-          <div className="panel">
+          <div className="panel" data-tour="chart">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <h3>{active} — Price Chart</h3>
-              <div className="tf-tabs">
+              <div className="tf-tabs" data-tour="timeframe-tabs">
                 {Object.keys(RANGE_MAP).map((tf) => (
                   <button key={tf} className={timeframe === tf ? "active" : ""} onClick={() => setTimeframe(tf)}>{tf}</button>
                 ))}
@@ -658,7 +657,7 @@ export default function StockSage() {
           </div>
 
           <div className="grid-2">
-            <div className="panel">
+            <div className="panel" data-tour="signals">
               <h3>Signal</h3>
               {activeStock?.signal && (
                 <>
@@ -674,7 +673,7 @@ export default function StockSage() {
                 </>
               )}
             </div>
-            <div className="panel">
+            <div className="panel" data-tour="predictions">
               <h3>AI Prediction · {pred?.model}</h3>
               {pred ? (
                 <>
@@ -697,7 +696,7 @@ export default function StockSage() {
           </div>
         </main>
 
-        <aside className={`chat ${chatOpen ? "open-mobile" : ""}`}>
+        <aside className={`chat ${chatOpen ? "open-mobile" : ""}`} data-tour="chat">
           <div className="chat-h">
             <strong>StockSage AI</strong>
             <button className="settings-btn" onClick={() => setChatOpen(false)}>−</button>
@@ -735,14 +734,31 @@ export default function StockSage() {
       <button
         className="settings-btn"
         style={{ position: "fixed", top: 48, right: 100, zIndex: 50 }}
-        onClick={() => { setHelpAutoPlay(false); setHelpOpen(true); }}
+        onClick={() => setHelpOpen(true)}
         aria-label="Help tour"
       >
         ❓ Help
       </button>
-      <button className="settings-btn" style={{ position: "fixed", top: 48, right: 16, zIndex: 50 }} onClick={() => setSettingsOpen(!settingsOpen)}>⚙ Settings</button>
+      <button
+        className="settings-btn"
+        style={{ position: "fixed", top: 48, right: 16, zIndex: 50 }}
+        data-tour="settings-btn"
+        onClick={() => setSettingsOpen(!settingsOpen)}
+      >
+        ⚙ Settings
+      </button>
 
-      <HelpTour open={helpOpen} onClose={closeHelp} autoPlayOnOpen={helpAutoPlay} />
+      <HelpTour
+        open={helpOpen}
+        onClose={closeHelp}
+        appState={{
+          active,
+          timeframe,
+          settingsOpen,
+          messagesLength: messages.length,
+        }}
+        onStepEnter={onHelpStep}
+      />
 
       {settingsOpen && (
         <div style={{ position: "fixed", top: 80, right: 16, background: "var(--panel)", border: "1px solid var(--border)", padding: 16, borderRadius: 8, zIndex: 100, width: 280, fontSize: "0.85rem" }}>
