@@ -1,27 +1,40 @@
 # StockSage — AI Stock Monitor
 
-Bloomberg-style dark dashboard with live Yahoo Finance data, technical signals, JS prediction model, and AI chat.
+Bloomberg-style dashboard with live Yahoo Finance data, technical signals, predictions, and AI chat.
 
-## Run locally
+## Run locally (required)
+
+StockSage uses **JSX** — you cannot open `index.html` by double-clicking. Use the dev server:
 
 ```powershell
 cd c:\Users\anil1299\projects\stocksage
-python -m http.server 8080
+powershell -ExecutionPolicy Bypass -File start.ps1
 ```
 
-Open **http://localhost:8080** (ES modules require a local server).
+Or manually:
+
+```powershell
+cd c:\Users\anil1299\projects\stocksage
+npm install
+npm run dev
+```
+
+Browser opens at **http://localhost:5173**
+
+## Build for production
+
+```powershell
+npm run build
+npm run preview
+```
+
+Deploy the `dist/` folder to Vercel (Framework: Vite).
 
 ## Features
 
-- Live watchlist (Yahoo Finance via CORS proxy)
-- Recharts price chart + SMA 20/50
-- RSI, MACD, Bollinger, volume composite BUY/SELL signal
-- 7d / 30d price prediction (weighted trend + seasonality)
-- Daily top pick
-- AI chat (local analyst, or add Anthropic API key in Settings)
-
-## Optional: Claude API
-
-Click **⚙ Settings** → paste your Anthropic API key for full Claude responses.
+- Live watchlist via Yahoo Finance
+- Charts + SMA overlays (Recharts)
+- BUY/SELL signals, price predictions
+- Daily pick, AI chat (optional Anthropic key in Settings)
 
 _Not financial advice._
