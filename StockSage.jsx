@@ -3,6 +3,7 @@ import {
   Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
   ReferenceLine, ComposedChart, CartesianGrid,
 } from "recharts";
+import HelpTour, { shouldShowHelpOnFirstVisit, markHelpSeen } from "./src/HelpTour.jsx";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DEFAULT_WATCHLIST = ["AAPL", "TSLA", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "SPY"];
@@ -386,6 +387,8 @@ export default function StockSage() {
   const [chatBusy, setChatBusy] = useState(false);
   const [toast, setToast] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpAutoPlay, setHelpAutoPlay] = useState(false);
   const [theme, setTheme] = useState("dark");
   const [refreshMin, setRefreshMin] = useState(5);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("stocksage_api_key") || "");
@@ -454,8 +457,18 @@ export default function StockSage() {
       setLoading(false);
       setToast("Market data loaded — " + watchlist.length + " stocks analyzed");
       setTimeout(() => setToast(null), 4000);
+      if (shouldShowHelpOnFirstVisit()) {
+        setHelpAutoPlay(true);
+        setHelpOpen(true);
+      }
     })();
   }, []);
+
+  const closeHelp = () => {
+    setHelpOpen(false);
+    setHelpAutoPlay(false);
+    markHelpSeen();
+  };
 
   useEffect(() => {
     if (!active) return;
@@ -719,7 +732,17 @@ export default function StockSage() {
         <button className="chat-fab" onClick={() => setChatOpen(true)} aria-label="Open chat">α</button>
       )}
 
+      <button
+        className="settings-btn"
+        style={{ position: "fixed", top: 48, right: 100, zIndex: 50 }}
+        onClick={() => { setHelpAutoPlay(false); setHelpOpen(true); }}
+        aria-label="Help tour"
+      >
+        ❓ Help
+      </button>
       <button className="settings-btn" style={{ position: "fixed", top: 48, right: 16, zIndex: 50 }} onClick={() => setSettingsOpen(!settingsOpen)}>⚙ Settings</button>
+
+      <HelpTour open={helpOpen} onClose={closeHelp} autoPlayOnOpen={helpAutoPlay} />
 
       {settingsOpen && (
         <div style={{ position: "fixed", top: 80, right: 16, background: "var(--panel)", border: "1px solid var(--border)", padding: 16, borderRadius: 8, zIndex: 100, width: 280, fontSize: "0.85rem" }}>

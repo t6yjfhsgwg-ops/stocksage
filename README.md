@@ -37,4 +37,9 @@ Deploy the `dist/` folder to Vercel (Framework: Vite).
 - BUY/SELL signals, price predictions
 - Daily pick, AI chat (optional Anthropic key in Settings)
 
+## Help tour & video script
+
+- In the app: click **❓ Help** (auto-plays on first visit like a video tour)
+- To record a real video: see [HELP-VIDEO-SCRIPT.md](HELP-VIDEO-SCRIPT.md)
+
 _Not financial advice._
