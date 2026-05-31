@@ -4,6 +4,19 @@ import {
   ReferenceLine, ComposedChart, CartesianGrid,
 } from "recharts";
 import HelpTour, { shouldShowHelpOnFirstVisit, markHelpSeen } from "./src/HelpTour.jsx";
+import PricingModal from "./src/PricingModal.jsx";
+import {
+  getStoredPlan,
+  getPlanConfig,
+  isPlus,
+  canSendChat,
+  incrementChatUsage,
+  chatRemaining,
+  getTrialDaysLeft,
+} from "./src/plans.js";
+import { predictSpreadStrategies } from "./src/spreadPredictions.js";
+import { predictOptionContracts } from "./src/optionPredictions.js";
+import { fetchMarketChart, parseChartResponse } from "./src/marketFetch.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DEFAULT_WATCHLIST = ["AAPL", "TSLA", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "SPY"];
@@ -25,6 +38,8 @@ const SIGNAL_LABELS = [
 const CHAT_CHIPS = [
   "📊 Analyze my watchlist",
   "🎯 Best stock to buy today?",
+  "📐 Best call or put?",
+  "📐 Best options spread?",
   "⚠️ Any red flags?",
   "📈 Market outlook?",
 ];
@@ -39,42 +54,18 @@ When users ask about stocks, provide:
 
 Current watchlist context will be provided in each message. Use it to give contextual answers.`;
 
-// ─── Yahoo Finance fetch ─────────────────────────────────────────────────────
+// ─── Market data (production: /api/chart on Vercel; dev: Vite middleware) ───
 async function yahooFetch(symbol, range = "3mo") {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`;
-  const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-  const res = await fetch(proxy);
-  if (!res.ok) throw new Error(`Fetch failed (${res.status})`);
-  const json = await res.json();
-  const r = json?.chart?.result?.[0];
-  if (!r) throw new Error("No chart data");
-  const q = r.indicators?.quote?.[0];
-  const ts = r.timestamp || [];
-  const closes = q?.close || [];
-  const opens = q?.open || [];
-  const highs = q?.high || [];
-  const lows = q?.low || [];
-  const volumes = q?.volume || [];
-  const points = ts
-    .map((t, i) => ({
-      date: new Date(t * 1000).toISOString().slice(0, 10),
-      ts: t,
-      close: closes[i],
-      open: opens[i],
-      high: highs[i],
-      low: lows[i],
-      volume: volumes[i],
-    }))
-    .filter((p) => p.close != null);
-  const meta = r.meta || {};
-  return {
-    symbol,
-    name: meta.longName || meta.shortName || symbol,
-    currency: meta.currency || "USD",
-    price: meta.regularMarketPrice ?? points.at(-1)?.close,
-    prevClose: meta.chartPreviousClose ?? meta.previousClose,
-    points,
-  };
+  const json = await fetchMarketChart(symbol, "1d", range);
+  return parseChartResponse(json, symbol);
+}
+
+/** Lightweight 1m chart fetch for live quote updates. */
+async function yahooLiveQuote(symbol) {
+  const json = await fetchMarketChart(symbol, "1m", "1d");
+  const data = parseChartResponse(json, symbol);
+  const change = data.prevClose ? ((data.price - data.prevClose) / data.prevClose) * 100 : 0;
+  return { symbol, price: data.price, prevClose: data.prevClose, change, at: Date.now() };
 }
 
 // ─── Math / indicators ───────────────────────────────────────────────────────
@@ -202,7 +193,8 @@ function compositeSignal(closes, volumes, price) {
   const s20 = sma(closes, 20).at(-1);
   const s50 = sma(closes, 50).at(-1);
   const bb = bollinger(closes);
-  const volAvg = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const volSlice = volumes.slice(-20).filter((v) => v > 0);
+  const volAvg = volSlice.length ? volSlice.reduce((a, b) => a + b, 0) / volSlice.length : 0;
   const volNow = volumes.at(-1) || 0;
   const volSpike = volNow > volAvg * 1.3;
 
@@ -214,7 +206,7 @@ function compositeSignal(closes, volumes, price) {
     scores.push(s);
     rows.push({ name: "RSI (14)", value: rsi.toFixed(1), signal: s >= 0.8 ? "BUY" : s <= 0.2 ? "SELL" : "NEUTRAL" });
   }
-  if (macd.macd != null) {
+  if (macd.macd != null && macd.hist != null && Number.isFinite(macd.hist)) {
     const s = macd.hist > 0 ? 0.85 : 0.15;
     scores.push(s);
     rows.push({ name: "MACD", value: macd.hist.toFixed(3), signal: s >= 0.6 ? "BUY" : "SELL" });
@@ -250,7 +242,21 @@ function analyzeStock(data) {
   const change = data.prevClose ? ((data.price - data.prevClose) / data.prevClose) * 100 : 0;
   const signal = compositeSignal(closes, volumes, data.price);
   const prediction = predictPrices(data.points);
-  return { ...data, change, signal, prediction };
+  const spreadPredictions = predictSpreadStrategies({
+    symbol: data.symbol,
+    price: data.price,
+    prediction,
+    signal,
+    points: data.points,
+  });
+  const optionPredictions = predictOptionContracts({
+    symbol: data.symbol,
+    price: data.price,
+    prediction,
+    signal,
+    points: data.points,
+  });
+  return { ...data, change, signal, prediction, spreadPredictions, optionPredictions };
 }
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
@@ -272,6 +278,13 @@ const css = `
 .sidebar-h { padding: 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .sidebar-h h2 { font-size: 0.85rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .live-dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%; animation: pulse 1.5s infinite; }
+.live-dot.streaming { background: #00d4ff; box-shadow: 0 0 8px #00d4ff; }
+.live-ts { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); }
+.btn-live {
+  background: transparent; border: 1px solid #00d4ff; color: #00d4ff;
+  padding: 6px 12px; border-radius: 6px; font-size: 0.78rem; cursor: pointer; font-family: var(--ui);
+}
+.btn-live.on { background: rgba(0, 212, 255, 0.15); font-weight: 700; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 .watchlist { flex: 1; overflow-y: auto; }
 .wl-row { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
@@ -302,10 +315,55 @@ const css = `
 .signal-badge.strong-sell { background: rgba(255,71,87,0.3); color: var(--red); }
 .ind-table { width: 100%; font-family: var(--mono); font-size: 0.78rem; border-collapse: collapse; }
 .ind-table th, .ind-table td { padding: 8px; text-align: left; border-bottom: 1px solid var(--border); }
+.ind-table td.sig-buy { color: var(--buy); }
+.ind-table td.sig-sell { color: var(--red); }
+.ind-table td.sig-neutral { color: var(--amber); }
+.pred-box.pred-locked { position: relative; opacity: 0.55; }
+.pred-box.pred-locked .val { filter: blur(4px); user-select: none; }
+.pred-lock-tag {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 0.7rem; color: var(--green); font-weight: 700; letter-spacing: 0.05em;
+}
 .pred-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; font-family: var(--mono); }
 .pred-box { background: var(--bg); padding: 12px; border-radius: 6px; border: 1px solid var(--border); }
 .pred-box .lbl { font-size: 0.7rem; color: var(--muted); }
 .pred-box .val { font-size: 1.1rem; margin-top: 4px; }
+.spread-panel { margin-top: 0; }
+.spread-meta { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); margin-bottom: 14px; }
+.spread-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.spread-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+  font-size: 0.82rem;
+}
+.spread-card.best { border-color: var(--green); box-shadow: 0 0 16px rgba(0, 255, 136, 0.12); }
+.spread-card h4 { font-size: 0.9rem; margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.spread-verdict { font-size: 0.7rem; padding: 2px 8px; border-radius: 4px; font-family: var(--mono); }
+.spread-verdict.favorable { background: rgba(0,255,136,0.2); color: var(--green); }
+.spread-verdict.neutral { background: rgba(255,179,71,0.2); color: var(--amber); }
+.spread-verdict.unfavorable { background: rgba(255,71,87,0.2); color: var(--red); }
+.spread-legs { font-family: var(--mono); color: var(--green); font-size: 0.8rem; margin: 8px 0; }
+.spread-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-family: var(--mono); font-size: 0.72rem; margin-top: 10px; }
+.spread-stats span { color: var(--muted); }
+.spread-note { margin-top: 10px; font-size: 0.75rem; color: var(--muted); line-height: 1.45; }
+.spread-pnl.up { color: var(--green); }
+.spread-pnl.down { color: var(--red); }
+.option-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.75rem; margin-top: 8px; }
+.option-table th, .option-table td { padding: 8px 6px; text-align: left; border-bottom: 1px solid var(--border); }
+.option-table th { color: var(--muted); font-weight: 500; font-size: 0.68rem; text-transform: uppercase; }
+.option-table tr.best-row { background: rgba(0, 255, 136, 0.06); }
+.option-table .type-call { color: var(--green); }
+.option-table .type-put { color: var(--amber); }
+.option-combo-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.option-combo {
+  flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px; font-size: 0.8rem;
+}
+.option-tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.option-tabs button {
+  background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+  padding: 6px 12px; border-radius: 6px; cursor: pointer; font-family: var(--ui); font-size: 0.78rem;
+}
+.option-tabs button.active { border-color: var(--green); color: var(--green); }
 .chat { background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .chat-h { padding: 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .chat-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
@@ -329,6 +387,27 @@ const css = `
 .skeleton { background: linear-gradient(90deg, var(--panel2) 25%, var(--border) 50%, var(--panel2) 75%); background-size: 200% 100%; animation: shimmer 1.2s infinite; height: 20px; border-radius: 4px; }
 @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
 .light { --bg: #f0f4f8; --panel: #fff; --panel2: #e8eef4; --border: #c5d0dc; --text: #0a1628; --muted: #5a6a7a; }
+.plan-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 16px; background: linear-gradient(90deg, #0d2040, #0a1628);
+  border-bottom: 1px solid var(--border); font-size: 0.8rem; flex-wrap: wrap;
+}
+.plan-badge {
+  font-family: var(--mono); font-size: 0.72rem; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.plan-badge.plus { border-color: var(--green); color: var(--green); }
+.btn-upgrade {
+  background: var(--green); color: #050a14; border: none; padding: 6px 14px;
+  border-radius: 6px; font-weight: 700; font-size: 0.78rem; cursor: pointer; font-family: var(--ui);
+}
+.btn-join-free {
+  background: transparent; color: var(--green); border: 1px solid var(--green);
+  padding: 6px 14px; border-radius: 6px; font-size: 0.78rem; cursor: pointer; font-family: var(--ui);
+}
+.wl-row.locked { opacity: 0.45; pointer-events: none; }
+.wl-row.locked::after { content: "🔒 Plus"; font-size: 0.65rem; color: var(--amber); display: block; margin-top: 4px; }
+.chat-quota { font-size: 0.72rem; color: var(--muted); padding: 0 12px 8px; }
 `;
 
 // ─── Local AI fallback (no API key) ──────────────────────────────────────────
@@ -344,7 +423,42 @@ function localChatReply(userMsg, context) {
   }
   const sym = context.stocks.find((s) => lower.includes(s.symbol.toLowerCase()));
   if (sym) {
-    return `**${sym.symbol}** @ $${sym.price?.toFixed(2)}\n• Signal: ${sym.signal.label}\n• RSI area: ${sym.signal.rsi?.toFixed(1) ?? "—"}\n• 7d forecast: $${sym.prediction?.d7?.toFixed(2) ?? "—"} (${sym.prediction?.direction === "up" ? "▲" : "▼"})\n\n_Not financial advice._`;
+    const best = sym.spreadPredictions?.bestPick;
+    const opt = sym.optionPredictions?.bestPick;
+    const spreadLine = best
+      ? `\n• Top spread: **${best.name}** (${best.verdict}, est P/L @7d ${best.pnlAt7d >= 0 ? "+" : ""}$${best.pnlAt7d?.toFixed(2)})`
+      : "";
+    const optLine = opt
+      ? `\n• Top option: **${opt.contract}** (${opt.verdict}, prem ~$${opt.estPremium?.toFixed(2)}, est mark P/L 7d ${opt.pnlMark7d >= 0 ? "+" : ""}$${opt.pnlMark7d?.toFixed(2)})`
+      : "";
+    return `**${sym.symbol}** @ $${sym.price?.toFixed(2)}\n• Signal: ${sym.signal.label}\n• RSI area: ${sym.signal.rsi?.toFixed(1) ?? "—"}\n• 7d forecast: $${sym.prediction?.d7?.toFixed(2) ?? "—"} (${sym.prediction?.direction === "up" ? "▲" : "▼"})${optLine}${spreadLine}\n\n_Not financial advice._`;
+  }
+  if (lower.includes("spread") || lower.includes("option")) {
+    const top = [...context.stocks]
+      .filter((s) => s.spreadPredictions?.bestPick)
+      .sort((a, b) => b.spreadPredictions.bestPick.fitScore - a.spreadPredictions.bestPick.fitScore)[0];
+    if (top) {
+      const o = top.optionPredictions?.bestPick;
+      const b = top.spreadPredictions?.bestPick;
+      const lines = [`**Options outlook for ${top.symbol}** (7d → $${top.prediction?.d7?.toFixed(2)})`];
+      if (o) {
+        lines.push(`• Best single leg: **${o.contract}** ${o.type} ${o.moneyness} — prem ~$${o.estPremium?.toFixed(2)}, Δ≈${o.delta}, BE $${o.breakeven?.toFixed(2)} (${o.moveNeededPct >= 0 ? "+" : ""}${o.moveNeededPct?.toFixed(1)}%)`);
+        lines.push(`• Est. mark P/L @7d: ${o.pnlMark7d >= 0 ? "+" : ""}$${o.pnlMark7d?.toFixed(2)} — ${o.verdict}`);
+      }
+      if (top.optionPredictions?.bestCall) {
+        const c = top.optionPredictions.bestCall;
+        lines.push(`• Best call: ${c.contract} (~$${c.estPremium?.toFixed(2)})`);
+      }
+      if (top.optionPredictions?.bestPut) {
+        const p = top.optionPredictions.bestPut;
+        lines.push(`• Best put: ${p.contract} (~$${p.estPremium?.toFixed(2)})`);
+      }
+      if (b) {
+        lines.push(`• Best spread: **${b.name}** (${b.legs}) — ${b.verdict}`);
+      }
+      lines.push("\n_Not financial advice. Modeled premiums, not live chain._");
+      return lines.join("\n");
+    }
   }
   return `I can analyze your watchlist (${context.stocks.map((s) => s.symbol).join(", ")}). Ask about a specific ticker or tap a quick question chip.\n\n_Not financial advice._`;
 }
@@ -388,6 +502,10 @@ export default function StockSage() {
   const [toast, setToast] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [pricingOpen, setPricingOpen] = useState(false);
+  const [planId, setPlanId] = useState(() => getStoredPlan());
+  const plan = useMemo(() => getPlanConfig(planId), [planId]);
+  const plus = isPlus(planId);
   const [theme, setTheme] = useState("dark");
   const [refreshMin, setRefreshMin] = useState(5);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("stocksage_api_key") || "");
@@ -395,6 +513,11 @@ export default function StockSage() {
     try { return JSON.parse(localStorage.getItem("stocksage_portfolio") || "{}"); } catch { return {}; }
   });
   const [newTicker, setNewTicker] = useState("");
+  const [optionTab, setOptionTab] = useState("singles");
+  const [liveMode, setLiveMode] = useState(() => localStorage.getItem("stocksage_live") === "1");
+  const [liveSec, setLiveSec] = useState(() => Number(localStorage.getItem("stocksage_live_sec") || 30));
+  const [lastLiveAt, setLastLiveAt] = useState(null);
+  const liveBusyRef = useRef(false);
   const tickRef = useRef({});
 
   const stockList = useMemo(
@@ -412,6 +535,30 @@ export default function StockSage() {
   const loadStock = useCallback(async (symbol, range = "3mo") => {
     const data = await yahooFetch(symbol, range);
     return analyzeStock(data);
+  }, []);
+
+  /** Chart uses selected timeframe; signals/predictions always use 3mo history. */
+  const loadActiveViews = useCallback(async (symbol, tf) => {
+    const chartRange = RANGE_MAP[tf] || "3mo";
+    const chartRaw = await yahooFetch(symbol, chartRange);
+    const analysisRaw = chartRange === "3mo" ? chartRaw : await yahooFetch(symbol, "3mo");
+    const analyzed = analyzeStock(analysisRaw);
+    const merged = {
+      ...analyzed,
+      price: chartRaw.price ?? analyzed.price,
+      change: chartRaw.prevClose
+        ? ((chartRaw.price - chartRaw.prevClose) / chartRaw.prevClose) * 100
+        : analyzed.change,
+    };
+    const closes = chartRaw.points.map((p) => p.close);
+    const s20 = sma(closes, 20);
+    const s50 = sma(closes, 50);
+    const chart = chartRaw.points.map((p, i) => ({
+      ...p,
+      sma20: i >= 19 ? s20[i - 19] : null,
+      sma50: i >= 49 ? s50[i - 49] : null,
+    }));
+    return { stock: merged, chart };
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -473,23 +620,18 @@ export default function StockSage() {
     if (!active) return;
     (async () => {
       try {
-        const d = await loadStock(active, RANGE_MAP[timeframe] || "3mo");
-        setStocks((prev) => ({ ...prev, [active]: d }));
-        const closes = d.points.map((p) => p.close);
-        const s20 = sma(closes, 20);
-        const s50 = sma(closes, 50);
-        setChartData(
-          d.points.map((p, i) => ({
-            ...p,
-            sma20: i >= 19 ? s20[i - 19] : null,
-            sma50: i >= 49 ? s50[i - 49] : null,
-          }))
-        );
+        const { stock, chart } = await loadActiveViews(active, timeframe);
+        setStocks((prev) => ({ ...prev, [active]: stock }));
+        setChartData(chart);
       } catch (e) {
         console.error(e);
       }
     })();
-  }, [active, timeframe, loadStock]);
+  }, [active, timeframe, loadActiveViews]);
+
+  useEffect(() => {
+    if (!plus && refreshMin === 1) setRefreshMin(5);
+  }, [plus, refreshMin]);
 
   useEffect(() => {
     if (refreshMin === 0) return;
@@ -497,9 +639,105 @@ export default function StockSage() {
     return () => clearInterval(id);
   }, [refreshMin, refreshAll]);
 
+  const refreshLiveQuotes = useCallback(async () => {
+    if (liveBusyRef.current) return;
+    liveBusyRef.current = true;
+    try {
+      const indexSymbols = INDICES.map((i) => i.symbol);
+      const results = await Promise.allSettled([
+        ...watchlist.map((s) => yahooLiveQuote(s)),
+        ...indexSymbols.map((s) => yahooLiveQuote(s)),
+      ]);
+      setStocks((prev) => {
+        const next = { ...prev };
+        watchlist.forEach((sym, i) => {
+          const r = results[i];
+          if (r.status === "fulfilled" && next[sym]) {
+            next[sym] = { ...next[sym], price: r.value.price, change: r.value.change };
+          }
+        });
+        return next;
+      });
+      setIndices((prev) => {
+        const next = { ...prev };
+        indexSymbols.forEach((sym, j) => {
+          const r = results[watchlist.length + j];
+          if (r.status === "fulfilled") {
+            const ind = INDICES.find((x) => x.symbol === sym);
+            next[sym] = { ...ind, ...prev[sym], price: r.value.price, change: r.value.change };
+          }
+        });
+        return next;
+      });
+      setLastLiveAt(new Date());
+    } catch (e) {
+      console.warn("Live quote refresh:", e);
+    }
+    liveBusyRef.current = false;
+  }, [watchlist]);
+
+  useEffect(() => {
+    localStorage.setItem("stocksage_live", liveMode ? "1" : "0");
+    localStorage.setItem("stocksage_live_sec", String(liveSec));
+  }, [liveMode, liveSec]);
+
+  useEffect(() => {
+    if (!liveMode) return;
+    const minSec = plus ? 15 : 30;
+    const sec = Math.max(minSec, liveSec);
+    const tick = () => {
+      if (!document.hidden) refreshLiveQuotes();
+    };
+    tick();
+    const id = setInterval(tick, sec * 1000);
+    return () => clearInterval(id);
+  }, [liveMode, liveSec, plus, refreshLiveQuotes]);
+
+  const toggleLive = () => {
+    if (!liveMode && !plus && liveSec < 30) setLiveSec(30);
+    setLiveMode((v) => !v);
+    if (!liveMode) setToast(`Live quotes on — every ${plus ? liveSec : Math.max(30, liveSec)}s`);
+    else setToast("Live quotes off");
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const openUpgrade = () => setPricingOpen(true);
+
+  const exportCsv = () => {
+    if (!plus) {
+      openUpgrade();
+      return;
+    }
+    const rows = [["Symbol", "Price", "Change%", "Signal", "Score"]];
+    stockList.forEach((s) => {
+      rows.push([
+        s.symbol,
+        s.price?.toFixed(2) ?? "",
+        s.change?.toFixed(2) ?? "",
+        s.signal?.label ?? "",
+        s.signal?.score != null ? (s.signal.score * 100).toFixed(0) : "",
+      ]);
+    });
+    const csv = rows.map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `stocksage-watchlist-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    setToast("Watchlist exported to CSV");
+    setTimeout(() => setToast(null), 3000);
+  };
+
   const sendChat = async (text) => {
     const msg = text.trim();
     if (!msg || chatBusy) return;
+    if (!canSendChat(planId)) {
+      setToast(`Daily chat limit reached (${plan.limits.chatPerDay}/day). Upgrade to Plus.`);
+      setTimeout(() => setToast(null), 4500);
+      openUpgrade();
+      return;
+    }
+    if (!plus) incrementChatUsage();
     setMessages((m) => [...m, { role: "user", content: msg }]);
     setChatInput("");
     setChatBusy(true);
@@ -521,6 +759,12 @@ export default function StockSage() {
   const addTicker = () => {
     const t = newTicker.trim().toUpperCase();
     if (!t || watchlist.includes(t)) return;
+    if (watchlist.length >= plan.limits.watchlist) {
+      setToast(`Free plan: max ${plan.limits.watchlist} tickers. Upgrade for more.`);
+      setTimeout(() => setToast(null), 4000);
+      openUpgrade();
+      return;
+    }
     setWatchlist((w) => [...w, t]);
     setNewTicker("");
     loadStock(t).then((d) => setStocks((s) => ({ ...s, [t]: d })));
@@ -528,6 +772,23 @@ export default function StockSage() {
 
   const activeStock = stocks[active];
   const pred = activeStock?.prediction;
+  const spreads = activeStock?.spreadPredictions;
+  const optionsPred = activeStock?.optionPredictions;
+  const visibleSpreads = plus ? spreads?.spreads : spreads?.spreads?.slice(0, 2);
+  const visibleOptions = plus ? optionsPred?.options : optionsPred?.options?.slice(0, 3);
+  const trialDays = getTrialDaysLeft();
+  const chatLeft = chatRemaining(planId);
+  const allowedTimeframes = plan.limits.timeframes;
+
+  const setTimeframeGated = (tf) => {
+    if (!allowedTimeframes.includes(tf)) {
+      setToast(`${tf} charts are a Plus feature`);
+      setTimeout(() => setToast(null), 3500);
+      openUpgrade();
+      return;
+    }
+    setTimeframe(tf);
+  };
 
   if (loading) {
     return (
@@ -546,6 +807,43 @@ export default function StockSage() {
       <style>{css}</style>
       <div className="disclaimer">
         StockSage is for informational purposes only. Not financial advice. Always do your own research.
+      </div>
+
+      <div className="plan-bar">
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span className={`plan-badge ${plus ? "plus" : ""}`}>
+            {plus ? `◈ Plus${trialDays > 0 ? ` · trial ${trialDays}d` : ""}` : "◈ Free plan"}
+          </span>
+          {!plus && chatLeft != null && (
+            <span style={{ color: "var(--muted)", fontFamily: "var(--mono)", fontSize: "0.75rem" }}>
+              {chatLeft} AI chats left today
+            </span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button
+            type="button"
+            className={`btn-live ${liveMode ? "on" : ""}`}
+            onClick={toggleLive}
+            title="Poll latest prices every 15–60s (near real-time)"
+          >
+            {liveMode ? "● LIVE" : "○ Live quotes"}
+          </button>
+          {liveMode && lastLiveAt && (
+            <span className="live-ts">Updated {lastLiveAt.toLocaleTimeString()}</span>
+          )}
+          {plus && (
+            <button type="button" className="settings-btn" onClick={exportCsv}>↓ Export CSV</button>
+          )}
+          {!plus ? (
+            <>
+              <button type="button" className="btn-join-free" onClick={() => setPricingOpen(true)}>Join Free</button>
+              <button type="button" className="btn-upgrade" onClick={openUpgrade}>Upgrade to Plus</button>
+            </>
+          ) : (
+            <button type="button" className="settings-btn" onClick={openUpgrade}>Manage plan</button>
+          )}
+        </div>
       </div>
 
       <div className="market-strip" data-tour="market-strip">
@@ -574,7 +872,7 @@ export default function StockSage() {
         <aside className="sidebar" data-tour="watchlist">
           <div className="sidebar-h">
             <h2>Watchlist</h2>
-            <span className="live-dot" title="Live" />
+            <span className={`live-dot ${liveMode ? "streaming" : ""}`} title={liveMode ? "Live quotes streaming" : "Data loaded"} />
           </div>
           <div className="watchlist">
             {watchlist.map((sym) => {
@@ -612,15 +910,20 @@ export default function StockSage() {
 
         <main className="main">
           {dailyPick && (
-            <div className="daily-pick" data-tour="daily-pick">
+            <div className="daily-pick" data-tour="daily-pick" style={{ position: "relative" }}>
               <h3>⭐ Daily Pick · {dailyPick.ts}</h3>
               <div className="big">{dailyPick.symbol} — {dailyPick.name}</div>
               <p style={{ marginTop: 8, fontFamily: "var(--mono)" }}>
                 ${dailyPick.price?.toFixed(2)} · <span className={dailyPick.signal.cls}>{dailyPick.signal.label}</span> · Score {(dailyPick.signal.score * 100).toFixed(0)}%
               </p>
               <ul style={{ marginTop: 10, paddingLeft: 18, fontSize: "0.85rem", color: "var(--muted)" }}>
-                {dailyPick.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                {(plus ? dailyPick.reasons : dailyPick.reasons.slice(0, 1)).map((r, i) => <li key={i}>{r}</li>)}
               </ul>
+              {!plus && dailyPick.reasons.length > 1 && (
+                <button type="button" className="btn-upgrade" style={{ marginTop: 10 }} onClick={openUpgrade}>
+                  Unlock all {dailyPick.reasons.length} signal reasons — Plus
+                </button>
+              )}
               <button className="settings-btn" style={{ marginTop: 12 }} onClick={refreshAll}>↻ Refresh Pick</button>
             </div>
           )}
@@ -630,7 +933,15 @@ export default function StockSage() {
               <h3>{active} — Price Chart</h3>
               <div className="tf-tabs" data-tour="timeframe-tabs">
                 {Object.keys(RANGE_MAP).map((tf) => (
-                  <button key={tf} className={timeframe === tf ? "active" : ""} onClick={() => setTimeframe(tf)}>{tf}</button>
+                  <button
+                    key={tf}
+                    className={timeframe === tf ? "active" : ""}
+                    onClick={() => setTimeframeGated(tf)}
+                    title={!allowedTimeframes.includes(tf) ? "Plus feature" : undefined}
+                    style={!allowedTimeframes.includes(tf) ? { opacity: 0.5 } : undefined}
+                  >
+                    {tf}{!allowedTimeframes.includes(tf) ? " 🔒" : ""}
+                  </button>
                 ))}
               </div>
             </div>
@@ -658,19 +969,40 @@ export default function StockSage() {
 
           <div className="grid-2">
             <div className="panel" data-tour="signals">
-              <h3>Signal</h3>
-              {activeStock?.signal && (
+              <h3>Signal · {active}</h3>
+              {activeStock?.signal ? (
                 <>
-                  <div className={`signal-badge ${activeStock.signal.cls}`}>{activeStock.signal.label}</div>
+                  <div className={`signal-badge ${activeStock.signal.cls}`}>
+                    {activeStock.signal.label}
+                    <span style={{ marginLeft: 10, fontSize: "0.85rem", opacity: 0.85 }}>
+                      ({(activeStock.signal.score * 100).toFixed(0)}% composite)
+                    </span>
+                  </div>
                   <table className="ind-table">
-                    <thead><tr><th>Indicator</th><th>Value</th><th>Signal</th></tr></thead>
+                    <thead>
+                      <tr><th>Indicator</th><th>Value</th><th>Signal</th></tr>
+                    </thead>
                     <tbody>
                       {activeStock.signal.rows.map((r) => (
-                        <tr key={r.name}><td>{r.name}</td><td>{r.value}</td><td>{r.signal}</td></tr>
+                        <tr key={r.name}>
+                          <td>{r.name}</td>
+                          <td>{r.value}</td>
+                          <td className={
+                            r.signal === "BUY" ? "sig-buy"
+                              : r.signal === "SELL" ? "sig-sell"
+                                : "sig-neutral"
+                          }>
+                            {r.signal}
+                          </td>
+                        </tr>
                       ))}
                     </tbody>
                   </table>
                 </>
+              ) : (
+                <p style={{ color: "var(--muted)", fontSize: "0.9rem" }}>
+                  {activeStock ? "Loading signals…" : "Select a stock from the watchlist."}
+                </p>
               )}
             </div>
             <div className="panel" data-tour="predictions">
@@ -683,16 +1015,172 @@ export default function StockSage() {
                   <div className="pred-grid">
                     <div className="pred-box"><div className="lbl">Tomorrow</div><div className="val">${pred.tomorrow?.toFixed(2)}</div></div>
                     <div className="pred-box"><div className="lbl">7 days</div><div className="val">${pred.d7?.toFixed(2)}</div></div>
-                    <div className="pred-box"><div className="lbl">30 days</div><div className="val">${pred.d30?.toFixed(2)}</div></div>
+                    <div className={`pred-box ${!plus ? "pred-locked" : ""}`}>
+                      <div className="lbl">30 days</div>
+                      <div className="val">${pred.d30?.toFixed(2)}</div>
+                      {!plus && <span className="pred-lock-tag">PLUS</span>}
+                    </div>
                   </div>
-                  <p style={{ marginTop: 10, fontSize: "0.75rem", color: "var(--muted)" }}>
-                    Band (7d): ${pred.bandLow?.toFixed(2)} — ${pred.bandHigh?.toFixed(2)}
-                  </p>
+                  {plus && (
+                    <p style={{ marginTop: 10, fontSize: "0.75rem", color: "var(--muted)" }}>
+                      Band (7d): ${pred.bandLow?.toFixed(2)} — ${pred.bandHigh?.toFixed(2)}
+                    </p>
+                  )}
+                  {!plus && (
+                    <button type="button" className="btn-upgrade" style={{ marginTop: 10 }} onClick={openUpgrade}>
+                      Unlock 30-day forecast & bands
+                    </button>
+                  )}
                 </>
               ) : (
                 <p style={{ color: "var(--muted)" }}>Insufficient data</p>
               )}
             </div>
+          </div>
+
+          <div className="panel spread-panel" data-tour="option-predictions">
+            <h3>Option prediction · {active}</h3>
+            <p className="spread-meta">
+              Modeled premiums · HV {optionsPred?.hv ?? "—"}% · 7d move forecast {optionsPred?.forecastMove7d?.toFixed(1) ?? "—"}%
+              · {optionsPred?.expiryHint ?? "—"}
+            </p>
+            {optionsPred?.bestPick && (
+              <p style={{ fontSize: "0.85rem", marginBottom: 10 }}>
+                Top pick: <strong style={{ color: "var(--green)" }}>{optionsPred.bestPick.contract}</strong>
+                {" "}{optionsPred.bestPick.type} ({optionsPred.bestPick.moneyness}) — {optionsPred.bestPick.verdict}
+                {" · "}est. premium ${optionsPred.bestPick.estPremium?.toFixed(2)}
+              </p>
+            )}
+            <div className="option-tabs">
+              <button type="button" className={optionTab === "singles" ? "active" : ""} onClick={() => setOptionTab("singles")}>
+                Single legs
+              </button>
+              <button type="button" className={optionTab === "combos" ? "active" : ""} onClick={() => setOptionTab("combos")}>
+                Straddle / Strangle
+              </button>
+            </div>
+            {optionTab === "singles" && visibleOptions?.length ? (
+              <table className="option-table">
+                <thead>
+                  <tr>
+                    <th>Contract</th><th>Type</th><th>Strike</th><th>Premium</th>
+                    <th>Pred. 7d</th><th>P/L 7d</th><th>Δ</th><th>BE move</th><th>Outlook</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleOptions.map((o) => (
+                    <tr key={o.id} className={optionsPred.bestPick?.id === o.id ? "best-row" : ""}>
+                      <td><strong>{o.contract}</strong></td>
+                      <td className={o.type === "Call" ? "type-call" : "type-put"}>{o.type} {o.moneyness}</td>
+                      <td>${o.strike}</td>
+                      <td>${o.estPremium?.toFixed(2)}</td>
+                      <td>${o.predictedPremium7d?.toFixed(2)}</td>
+                      <td className={o.pnlMark7d >= 0 ? "spread-pnl up" : "spread-pnl down"}>
+                        {o.pnlMark7d >= 0 ? "+" : ""}${o.pnlMark7d?.toFixed(2)}
+                      </td>
+                      <td>{o.delta}</td>
+                      <td>{o.moveNeededPct >= 0 ? "+" : ""}{o.moveNeededPct?.toFixed(1)}%</td>
+                      <td><span className={`spread-verdict ${o.verdictCls}`}>{o.verdict}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : optionTab === "combos" && optionsPred?.combos?.length ? (
+              <div className="option-combo-row">
+                {(plus ? optionsPred.combos : optionsPred.combos.slice(0, 1)).map((c) => (
+                  <div key={c.id} className="option-combo">
+                    <strong>{c.name}</strong>
+                    <span className={`spread-verdict ${c.verdictCls}`} style={{ marginLeft: 8 }}>{c.verdict}</span>
+                    <div className="spread-legs" style={{ marginTop: 6 }}>{c.legs}</div>
+                    <div className="spread-stats" style={{ marginTop: 8 }}>
+                      <div><span>Est. cost</span><div>${c.estCost?.toFixed(2)}</div></div>
+                      <div><span>P/L mark 7d</span>
+                        <div className={c.pnlMark7d >= 0 ? "spread-pnl up" : "spread-pnl down"}>
+                          {c.pnlMark7d >= 0 ? "+" : ""}${c.pnlMark7d?.toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="spread-note">{c.note}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p style={{ color: "var(--muted)" }}>Select a stock to see option predictions.</p>
+            )}
+            {!plus && (optionsPred?.options?.length ?? 0) > 3 && optionTab === "singles" && (
+              <button type="button" className="btn-upgrade" style={{ marginTop: 12 }} onClick={openUpgrade}>
+                Unlock all {optionsPred.options.length} contracts + combos — Plus
+              </button>
+            )}
+          </div>
+
+          <div className="panel spread-panel" data-tour="spread-predictions">
+            <h3>Spread options prediction · {active}</h3>
+            <p className="spread-meta">
+              Educational model from price forecast + historical vol ({spreads?.hv ?? "—"}% HV)
+              · {spreads?.expiryHint ?? "—"} · Width ~${spreads?.width?.toFixed(0) ?? "—"}
+            </p>
+            {spreads?.bestPick && (
+              <p style={{ fontSize: "0.85rem", marginBottom: 12 }}>
+                Top fit: <strong style={{ color: "var(--green)" }}>{spreads.bestPick.name}</strong>
+                {" "}({spreads.bestPick.bias}) — {spreads.bestPick.verdict} at 7d target
+              </p>
+            )}
+            {visibleSpreads?.length ? (
+              <div className="spread-grid">
+                {visibleSpreads.map((s) => (
+                  <div
+                    key={s.id}
+                    className={`spread-card ${spreads.bestPick?.id === s.id ? "best" : ""}`}
+                  >
+                    <h4>
+                      {s.name}
+                      <span className={`spread-verdict ${s.verdictCls}`}>{s.verdict}</span>
+                    </h4>
+                    <div style={{ color: "var(--muted)", fontSize: "0.75rem" }}>{s.bias} · {s.structure}</div>
+                    <div className="spread-legs">{s.legs}</div>
+                    <div className="spread-stats">
+                      <div>
+                        <span>Cost / credit</span>
+                        <div>
+                          {s.estDebit != null ? `Debit $${s.estDebit.toFixed(2)}` : `Credit $${s.estCredit?.toFixed(2)}`}
+                        </div>
+                      </div>
+                      <div>
+                        <span>Max profit / loss</span>
+                        <div>
+                          +${s.maxProfit?.toFixed(2)} / −${s.maxLoss?.toFixed(2)}
+                        </div>
+                      </div>
+                      <div>
+                        <span>P/L @ 7d target</span>
+                        <div className={`spread-pnl ${s.pnlAt7d >= 0 ? "up" : "down"}`}>
+                          {s.pnlAt7d >= 0 ? "+" : ""}${s.pnlAt7d?.toFixed(2)}
+                          <span style={{ color: "var(--muted)" }}> (${s.targetPrice7d?.toFixed(2)})</span>
+                        </div>
+                      </div>
+                      <div>
+                        <span>P/L @ 30d target</span>
+                        <div className={`spread-pnl ${s.pnlAt30d >= 0 ? "up" : "down"}`}>
+                          {s.pnlAt30d >= 0 ? "+" : ""}${s.pnlAt30d?.toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                    <p className="spread-note">{s.note}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p style={{ color: "var(--muted)" }}>Load stock data to see spread outlook.</p>
+            )}
+            {!plus && (spreads?.spreads?.length ?? 0) > 2 && (
+              <button type="button" className="btn-upgrade" style={{ marginTop: 14 }} onClick={openUpgrade}>
+                Unlock all {spreads.spreads.length} spread strategies — Plus
+              </button>
+            )}
+            <p style={{ marginTop: 12, fontSize: "0.7rem", color: "var(--muted)" }}>
+              Strikes are modeled from spot — not live options chain. Options involve risk; not financial advice.
+            </p>
           </div>
         </main>
 
@@ -715,6 +1203,9 @@ export default function StockSage() {
             ))}
             {chatBusy && <div className="msg ai" style={{ fontStyle: "italic", color: "var(--muted)" }}>Analyzing…</div>}
           </div>
+          {!plus && chatLeft != null && (
+            <div className="chat-quota">{chatLeft} of {plan.limits.chatPerDay} AI messages left today</div>
+          )}
           <div className="chips">
             {CHAT_CHIPS.map((c) => (
               <button key={c} className="chip" onClick={() => sendChat(c)}>{c}</button>
@@ -760,6 +1251,16 @@ export default function StockSage() {
         onStepEnter={onHelpStep}
       />
 
+      <PricingModal
+        open={pricingOpen}
+        onClose={() => setPricingOpen(false)}
+        onPlanChange={(id) => {
+          setPlanId(id);
+          setToast(id === "plus" ? "Plus trial started — enjoy full features!" : "Switched to Free plan");
+          setTimeout(() => setToast(null), 4000);
+        }}
+      />
+
       {settingsOpen && (
         <div style={{ position: "fixed", top: 80, right: 16, background: "var(--panel)", border: "1px solid var(--border)", padding: 16, borderRadius: 8, zIndex: 100, width: 280, fontSize: "0.85rem" }}>
           <h3 style={{ marginBottom: 12 }}>Settings</h3>
@@ -768,13 +1269,58 @@ export default function StockSage() {
             <option value="dark">Dark</option>
             <option value="light">Light</option>
           </select>
-          <label style={{ display: "block", marginBottom: 8 }}>Refresh</label>
-          <select value={refreshMin} onChange={(e) => setRefreshMin(Number(e.target.value))} style={{ width: "100%", marginBottom: 12, padding: 8, background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)" }}>
+          <label style={{ display: "block", marginBottom: 8 }}>Live quotes (near real-time)</label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={liveMode} onChange={toggleLive} />
+            <span>Enable live polling</span>
+          </label>
+          <select
+            value={liveSec}
+            disabled={!liveMode}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (v < 30 && !plus) {
+                openUpgrade();
+                return;
+              }
+              setLiveSec(v);
+            }}
+            style={{ width: "100%", marginBottom: 12, padding: 8, background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {plus && <option value={15}>Every 15 seconds (Plus)</option>}
+            <option value={30}>Every 30 seconds</option>
+            <option value={60}>Every 60 seconds</option>
+          </select>
+          <p style={{ fontSize: "0.7rem", color: "var(--muted)", marginBottom: 12 }}>
+            Updates prices via 1-minute Yahoo data. Not tick-by-tick. Pauses when tab is hidden.
+          </p>
+          <label style={{ display: "block", marginBottom: 8 }}>Full refresh (signals & charts)</label>
+          <select
+            value={refreshMin}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (v === 1 && !plus) {
+                openUpgrade();
+                return;
+              }
+              setRefreshMin(v);
+            }}
+            style={{ width: "100%", marginBottom: 12, padding: 8, background: "var(--bg)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
             <option value={0}>Manual</option>
-            <option value={1}>1 min</option>
+            {plan.limits.refreshMin.includes(1) && <option value={1}>1 min (Plus)</option>}
             <option value={5}>5 min</option>
             <option value={15}>15 min</option>
           </select>
+          {!plus && (
+            <p style={{ fontSize: "0.72rem", color: "var(--muted)", marginBottom: 12 }}>
+              <button type="button" className="settings-btn" style={{ width: "100%" }} onClick={openUpgrade}>Upgrade for 1-min refresh</button>
+            </p>
+          )}
+          <p style={{ fontSize: "0.72rem", color: "var(--muted)", marginBottom: 8 }}>Plan: {plan.name}</p>
+          <button type="button" className="btn-upgrade" style={{ width: "100%", marginBottom: 12 }} onClick={openUpgrade}>
+            {plus ? "View plans" : "Upgrade to Plus — 14-day trial"}
+          </button>
           <label style={{ display: "block", marginBottom: 8 }}>Anthropic API key (optional)</label>
           <input type="password" value={apiKey} onChange={(e) => { setApiKey(e.target.value); localStorage.setItem("stocksage_api_key", e.target.value); }} placeholder="sk-ant-…" style={{ width: "100%", padding: 8, marginBottom: 12, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)" }} />
           <p style={{ color: "var(--muted)", fontSize: "0.75rem", marginBottom: 8 }}>Portfolio (shares per ticker)</p>
