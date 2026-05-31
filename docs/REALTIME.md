@@ -5,8 +5,9 @@
 | Layer | Behavior |
 |-------|----------|
 | **Full refresh** | Settings → 1 / 5 / 15 min — reloads watchlist, signals, predictions, charts |
-| **Live quotes** | Top bar **○ Live quotes** / **● LIVE** — polls 1m Yahoo data every 15–60s |
-| **Data source** | Yahoo Finance via `corsproxy.io` (browser only, no backend) |
+| **Live quotes** | Top bar **○ Live** / **● LIVE** — polls 1m Yahoo data every 15–60s |
+| **Live predictions** | While LIVE is on, `/api/predict-batch` refreshes signals & price targets every 30–60s |
+| **Data source** | Yahoo Finance via `/api/chart` (Vercel) or `corsproxy.io` fallback |
 
 Live mode is **near real-time** (seconds to a minute delay), not exchange tick-by-tick.
 
@@ -15,12 +16,21 @@ Live mode is **near real-time** (seconds to a minute delay), not exchange tick-b
 ## Quick start (built-in)
 
 1. Run the app: `.\start.ps1`
-2. Click **○ Live quotes** in the plan bar (turns **● LIVE**)
+2. Click **○ Live** in the plan bar (turns **● LIVE**)
 3. Or open **⚙ Settings** → enable **Live polling** → pick 15s (Plus) or 30s
-4. Watch **Updated HH:MM:SS** and watchlist prices refresh
+4. Watch **Quotes HH:MM · Pred HH:MM** and watchlist prices/signals refresh
 
-**Free:** minimum 30s interval  
-**Plus:** 15s interval  
+**Free:** quotes min 30s; predictions every 60s  
+**Plus:** quotes min 15s; predictions every 30s  
+
+### Prediction API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/predict?symbol=AAPL` | Full analysis for one symbol |
+| `GET /api/predict-batch?symbols=AAPL,TSLA` | Watchlist batch (max 12) |
+
+Server runs the same models as the browser (`lib/stockAnalysis.mjs`) on fresh Yahoo 3mo + 1m data.
 
 Polling **pauses** when the browser tab is hidden (saves proxy quota).
 

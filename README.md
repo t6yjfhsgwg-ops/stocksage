@@ -41,13 +41,18 @@ npm run preview
 1. Push repo to GitHub  
 2. Import on [Vercel](https://vercel.com) → Framework: **Vite**  
 3. Set env `ALLOWED_ORIGINS` = your Vercel URL  
-4. Deploy — `/api/chart` proxies Yahoo server-side (no browser CORS proxy)
+4. Deploy — `/api/chart` and `/api/predict*` run server-side (no browser CORS proxy)
 
 Copy [.env.example](.env.example) for variable reference.
 
-## Near real-time quotes
+## Near real-time (quotes + predictions)
 
-Click **○ Live quotes** in the top bar (or Settings → Live polling) to refresh prices every **15–60 seconds**.
+Click **○ Live** in the top bar (or Settings → Live polling):
+
+- **Quotes** — 1m Yahoo data every 15–60s  
+- **Predictions** — `/api/predict-batch` refreshes signals & price targets every 30–60s (when deployed with API)
+
+Details: [docs/REALTIME.md](docs/REALTIME.md)
 
 See [docs/REALTIME.md](docs/REALTIME.md) for true tick-by-tick / WebSocket setup.
 

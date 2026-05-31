@@ -17,6 +17,7 @@ import {
 import { predictSpreadStrategies } from "./src/spreadPredictions.js";
 import { predictOptionContracts } from "./src/optionPredictions.js";
 import { fetchMarketChart, parseChartResponse } from "./src/marketFetch.js";
+import { fetchBatchPredictions, predictionApiEnabled } from "./src/predictionClient.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DEFAULT_WATCHLIST = ["AAPL", "TSLA", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "SPY"];
@@ -517,7 +518,9 @@ export default function StockSage() {
   const [liveMode, setLiveMode] = useState(() => localStorage.getItem("stocksage_live") === "1");
   const [liveSec, setLiveSec] = useState(() => Number(localStorage.getItem("stocksage_live_sec") || 30));
   const [lastLiveAt, setLastLiveAt] = useState(null);
+  const [lastPredAt, setLastPredAt] = useState(null);
   const liveBusyRef = useRef(false);
+  const predBusyRef = useRef(false);
   const tickRef = useRef({});
 
   const stockList = useMemo(
@@ -676,6 +679,47 @@ export default function StockSage() {
     liveBusyRef.current = false;
   }, [watchlist]);
 
+  const updateDailyPickFromStocks = useCallback((stockMap) => {
+    const analyzed = Object.values(stockMap).filter(Boolean);
+    if (!analyzed.length) return;
+    const best = [...analyzed].sort((a, b) => b.signal.score - a.signal.score)[0];
+    const reasons = best.signal.rows
+      .filter((r) => r.signal === "BUY")
+      .slice(0, 3)
+      .map((r) => `${r.name}: ${r.value} (${r.signal})`);
+    if (reasons.length < 3) {
+      reasons.push(
+        `Composite score ${(best.signal.score * 100).toFixed(0)}%`,
+        `RSI ${best.signal.rsi?.toFixed(1) ?? "—"}`,
+        `Price $${best.price?.toFixed(2)}`
+      );
+    }
+    setDailyPick({ ...best, reasons, ts: new Date().toLocaleString() });
+  }, []);
+
+  const refreshLivePredictions = useCallback(async () => {
+    if (!predictionApiEnabled || predBusyRef.current) return;
+    predBusyRef.current = true;
+    try {
+      const { stocks: serverStocks, updatedAt } = await fetchBatchPredictions(watchlist);
+      if (serverStocks && Object.keys(serverStocks).length) {
+        let next;
+        setStocks((prev) => {
+          next = { ...prev };
+          Object.entries(serverStocks).forEach(([sym, s]) => {
+            if (s) next[sym] = { ...prev[sym], ...s, symbol: sym };
+          });
+          return next;
+        });
+        if (next) updateDailyPickFromStocks(next);
+        setLastPredAt(updatedAt ? new Date(updatedAt) : new Date());
+      }
+    } catch (e) {
+      console.warn("Live prediction refresh:", e);
+    }
+    predBusyRef.current = false;
+  }, [watchlist, updateDailyPickFromStocks]);
+
   useEffect(() => {
     localStorage.setItem("stocksage_live", liveMode ? "1" : "0");
     localStorage.setItem("stocksage_live_sec", String(liveSec));
@@ -693,12 +737,34 @@ export default function StockSage() {
     return () => clearInterval(id);
   }, [liveMode, liveSec, plus, refreshLiveQuotes]);
 
+  useEffect(() => {
+    if (!liveMode || !predictionApiEnabled) return;
+    const predSec = plus ? 30 : 60;
+    const tick = () => {
+      if (!document.hidden) refreshLivePredictions();
+    };
+    tick();
+    const id = setInterval(tick, predSec * 1000);
+    return () => clearInterval(id);
+  }, [liveMode, plus, refreshLivePredictions]);
+
   const toggleLive = () => {
     if (!liveMode && !plus && liveSec < 30) setLiveSec(30);
-    setLiveMode((v) => !v);
-    if (!liveMode) setToast(`Live quotes on — every ${plus ? liveSec : Math.max(30, liveSec)}s`);
-    else setToast("Live quotes off");
-    setTimeout(() => setToast(null), 3000);
+    const turningOn = !liveMode;
+    setLiveMode(turningOn);
+    if (turningOn) {
+      const qSec = plus ? liveSec : Math.max(30, liveSec);
+      const pSec = plus ? 30 : 60;
+      setToast(
+        predictionApiEnabled
+          ? `Live on — quotes every ${qSec}s, predictions every ${pSec}s`
+          : `Live quotes on — every ${qSec}s`
+      );
+      if (predictionApiEnabled) refreshLivePredictions();
+    } else {
+      setToast("Live mode off");
+    }
+    setTimeout(() => setToast(null), 4000);
   };
 
   const openUpgrade = () => setPricingOpen(true);
@@ -825,12 +891,19 @@ export default function StockSage() {
             type="button"
             className={`btn-live ${liveMode ? "on" : ""}`}
             onClick={toggleLive}
-            title="Poll latest prices every 15–60s (near real-time)"
+            title={predictionApiEnabled
+              ? "Live quotes + server-side prediction refresh (near real-time)"
+              : "Poll latest prices every 15–60s (near real-time)"}
           >
-            {liveMode ? "● LIVE" : "○ Live quotes"}
+            {liveMode ? "● LIVE" : "○ Live"}
           </button>
           {liveMode && lastLiveAt && (
-            <span className="live-ts">Updated {lastLiveAt.toLocaleTimeString()}</span>
+            <span className="live-ts">
+              Quotes {lastLiveAt.toLocaleTimeString()}
+              {predictionApiEnabled && lastPredAt && (
+                <> · Pred {lastPredAt.toLocaleTimeString()}</>
+              )}
+            </span>
           )}
           {plus && (
             <button type="button" className="settings-btn" onClick={exportCsv}>↓ Export CSV</button>
@@ -872,7 +945,12 @@ export default function StockSage() {
         <aside className="sidebar" data-tour="watchlist">
           <div className="sidebar-h">
             <h2>Watchlist</h2>
-            <span className={`live-dot ${liveMode ? "streaming" : ""}`} title={liveMode ? "Live quotes streaming" : "Data loaded"} />
+            <span
+              className={`live-dot ${liveMode ? "streaming" : ""}`}
+              title={liveMode
+                ? (predictionApiEnabled ? "Live quotes + predictions streaming" : "Live quotes streaming")
+                : "Data loaded"}
+            />
           </div>
           <div className="watchlist">
             {watchlist.map((sym) => {
@@ -1269,11 +1347,16 @@ export default function StockSage() {
             <option value="dark">Dark</option>
             <option value="light">Light</option>
           </select>
-          <label style={{ display: "block", marginBottom: 8 }}>Live quotes (near real-time)</label>
+          <label style={{ display: "block", marginBottom: 8 }}>Live mode (near real-time)</label>
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, cursor: "pointer" }}>
             <input type="checkbox" checked={liveMode} onChange={toggleLive} />
             <span>Enable live polling</span>
           </label>
+          {predictionApiEnabled && (
+            <p style={{ fontSize: "0.7rem", color: "var(--muted)", marginBottom: 8 }}>
+              Predictions refresh via <code>/api/predict-batch</code> every {plus ? 30 : 60}s while live is on.
+            </p>
+          )}
           <select
             value={liveSec}
             disabled={!liveMode}
@@ -1292,7 +1375,8 @@ export default function StockSage() {
             <option value={60}>Every 60 seconds</option>
           </select>
           <p style={{ fontSize: "0.7rem", color: "var(--muted)", marginBottom: 12 }}>
-            Updates prices via 1-minute Yahoo data. Not tick-by-tick. Pauses when tab is hidden.
+            Quotes use 1-minute Yahoo data. {predictionApiEnabled && "Signals and price targets refresh on the prediction service on a separate timer. "}
+            Not tick-by-tick. Pauses when tab is hidden.
           </p>
           <label style={{ display: "block", marginBottom: 8 }}>Full refresh (signals & charts)</label>
           <select
