@@ -43,14 +43,6 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: false,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          recharts: ["recharts"],
-          react: ["react", "react-dom"],
-        },
-      },
-    },
   },
   optimizeDeps: {
     include: ["react", "react-dom", "react-is", "recharts"],
